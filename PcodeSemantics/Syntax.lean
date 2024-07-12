@@ -2,14 +2,16 @@ import Mathlib
 
 /- I am not sure why Naus et al.-/
 /- defines this as a Word8 instead of a 64-bit value-/
-@[reducible] def Address: Type := UInt8
-@[reducible] def Size: Type := UInt8
+@[reducible] def Address: Type := Nat
+@[reducible] def Size: Type := Nat
+@[reducible] def BitVecArray: Type := (Array (BitVec 8))
 
 inductive VarNode: Type where
   | Reg:  Address × Size → VarNode
   | Ram: Address × Size → VarNode
   | Var: String × Size → VarNode
-  | Const: Array UInt8 × Size → VarNode
+  | Const: BitVecArray × Size → VarNode
+
 
 inductive PCodeInstruction: Type where
   | STORE: VarNode × VarNode × VarNode → PCodeInstruction
@@ -95,14 +97,52 @@ inductive PCodeOp: Type where
   | CAST: VarNode  → PCodeOp
 
 def Mem: Type := Batteries.HashMap Address (BitVec 8)
-def Mem.setValueAtOffset (mem: Mem) (addr: Address)
-  (data: Array (BitVec 8)): Mem :=
-  Batteries.HashMap.mergeWith (fun _ old new => new)
+
+def Mem.getValue (mem: Mem) (addr: Address)
+  (size: Size) : BitVecArray :=
+  ((List.range size).map
+    -- (fun off => BitVec.ofNat 8 off)).toArray
+    (fun off =>
+      let adj: Address := off + addr
+      (match mem.findEntry? adj with
+       | some (_, entry) => entry
+       | none => panic! "Missing data in memory"))
+   ).toArray
+
+def Mem.setValue (mem: Mem) (addr: Address)
+  (data: BitVecArray): Mem :=
+  Batteries.HashMap.mergeWith (fun _ _ new => new)
     (mem)
-    (Batteries.HashMap.ofList (List.range data.size).map (fun x => (x + addr, data[x])))
+    (Batteries.HashMap.ofList
+      ((List.range data.size).map
+        fun x => (x + addr, data.get! x))
+    )
 
 
 def Regs: Type := Batteries.HashMap Address (BitVec 8)
+
+-- TODO: Don't repeat yourself
+
+def Regs.setValue (regs: Regs) (addr: Address)
+  (data: BitVecArray): Mem :=
+  Batteries.HashMap.mergeWith (fun _ _ new => new)
+    (regs)
+    (Batteries.HashMap.ofList
+      ((List.range data.size).map
+        fun x => (x + addr, data.get! x))
+    )
+
+def Regs.getValue (regs: Regs) (addr: Address) (size: Size)
+  : BitVecArray :=
+  ((List.range size).map
+    -- (fun off => BitVec.ofNat 8 off)).toArray
+    (fun off =>
+      let adj: Address := off + addr
+      (match regs.findEntry? adj with
+       | some (_, entry) => entry
+       | none => panic! "Missing data in memory"))
+   ).toArray
+
 /- It appears in Naus et al.'s original work, this is
    64 bits because each offset in in mem/regs is 1 byte
    so you can just use 8 bytes for an 8-byte integer,
@@ -111,28 +151,47 @@ def Vars: Type := Batteries.HashMap String (Array (BitVec 8))
 
 -- Update the byte array at the variable location
 -- Size is in bytes
-def Vars.setValueAtOffset (vars: Vars) (string: String)
-      (size: Size) (value: Array (BitVec 8)) : Vars :=
-  if vars.contains string then
-   -- Update the array as well
-    vars.insert string (vars.find! string)
-  else
-    vars.insert string value
+def Vars.setValue (vars: Vars) (string: String) (value: BitVecArray) : Vars :=
+  vars.insert string value
+
+-- Get the slice of vars
+-- If vars is emtpy, zero. Should panic though.
+def Vars.getValue (vars: Vars) (string: String) (size: Size) : BitVecArray :=
+  match vars.findEntry? string with
+    -- truncate it.
+    | some (_, entry) => entry.extract 0 size
+    | none => panic! "Can't access invalid variables" -- (List.replicate size (BitVec.ofNat 8 0)).toArray
 
 
 def State: Type := Mem × Regs × Vars
 
+def State.mem : State → Mem
+  | ⟨ mem, _, _ ⟩ => mem
+
+def State.regs : State → Regs
+  | ⟨ _, regs, _ ⟩ => regs
+
+def State.vars : State → Vars
+  | ⟨ _, _, vars ⟩ => vars
 
 /- Largely taken from LoVelib.lean -/
 
-def State.update (input: VarNode) (value: BitVec 8) (state : State) : State :=
+def State.update (input: VarNode) (value: BitVecArray) (state : State) : State :=
   let ⟨mem, regs, vars⟩ := state
   match input with
   | VarNode.Reg (addr, size) => (mem, regs, vars)
-  | VarNode.Ram (addr, size) => (mem.insert addr value, regs, vars)
+  | VarNode.Ram (addr, size) => (mem.setValue addr value, regs, vars)
   | VarNode.Var (string, size) => (mem, regs, vars.insert string value)
   -- This is illegal. How do we panic in lean?
   | VarNode.Const (arr, size) => (mem, regs, vars)
 
 macro s:term "[" name:term "↦" val:term "]" : term =>
   `(State.update $name $val $s)
+
+def VarNode.getBytes (state: State) (vn: VarNode) : BitVecArray :=
+  let ⟨mem, regs, vars⟩ := state
+  match vn with
+  | VarNode.Reg (addr, sz) => regs.getValue addr sz
+  | VarNode.Ram (addr, sz) => mem.getValue addr sz
+  | VarNode.Var (string, sz) => vars.getValue string sz
+  | VarNode.Const (data, sz) => data.extract 0 sz
